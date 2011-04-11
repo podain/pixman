@@ -1358,10 +1358,11 @@ generate_composite_function \
      *
      * output: updated dest in {d28, d29, d30, d31}
      */
-    vmvn.8      q12, q12
-    vmvn.8      d26, d26
+    vmvn.8      d24, d24
+    vmvn.8      d25, d25
     vmull.u8    q8,  d24, d4
     vmull.u8    q9,  d25, d5
+    vmvn.8      d26, d26
     vmvn.8      d27, d3
     vmull.u8    q10, d26, d6
     vmull.u8    q11, d27, d7
@@ -2553,8 +2554,259 @@ fname:
 .endif
 .endm
 
-.macro bilinear_interpolate_last_pixel src_fmt, dst_fmt
+
+/*
+ * Macros to support bilinear scaled scanline function with mask enabled
+ * for operator OVER and ADD extending previous siarhei's bilinear macro template.
+ *
+ * << General scanline function procedures >>
+ *  1. bilinear interpolate source pixels
+ *  2. load mask pixels
+ *  3. load destination pixels
+ *  4. duplicate mask to fill whole register
+ *  5. interleave source & destination pixels
+ *  6. apply mask to source pixels
+ *  7. combine source & destination pixels
+ *  8. store destination pixels
+ *
+ * All registers with single number (i.e. src0, tmp0) are 64-bits registers.
+ * Registers with double numbers are 128-bits registers.
+ * All temp registers can be used freely outside the code block.
+ * Assume that symbol(register .req) OUT and MASK are defined at caller of these macro blocks.
+ *
+ * TODOs
+ *  Support 0565 pixel format
+ *  Optimization for two and last pixel cases
+ *
+ * Remarks
+ *  There can be lots of pipeline stalls inside code block and between code blocks.
+ *  Further optimizations will be done by new macro templates using head/tail_head/tail scheme.
+ */
+
+
+/*
+ * Macros for loading mask pixels into register 'mask'.
+ * vdup must be done in somewhere else.
+ */
+.macro bilinear_load_mask_n numpix, mask
+.endm
+
+.macro bilinear_load_mask_8 numpix, mask
+.if numpix == 4
+    vld1.32     {mask[0]}, [MASK]!
+.elseif numpix == 2
+    vld1.16     {mask[0]}, [MASK]!
+.elseif numpix == 1
+    vld1.8      {mask[0]}, [MASK]!
+.else
+    .error bilinear_load_mask_8 numpix is unsupported
+.endif
+.endm
+
+.macro bilinear_load_mask mask_fmt, numpix, mask
+    bilinear_load_mask_&mask_fmt numpix, mask
+.endm
+
+
+/*
+ * Macros for loading destination pixels into register 'dst0' and 'dst1'.
+ * Interleave should be done somewhere else.
+ */
+.macro bilinear_load_dst_0565_src numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_load_dst_8888_src numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_load_dst_8888 numpix, dst0, dst1, dst01
+.if numpix == 4
+    vld1.32     {dst0, dst1}, [OUT]
+.elseif numpix == 2
+    vld1.32     {dst0}, [OUT]
+.elseif numpix == 1
+    vld1.32     {dst0[0]}, [OUT]
+.else
+    .error bilinear_load_dst_8888 numpix is unsupported
+.endif
+.endm
+
+.macro bilinear_load_dst_8888_over numpix, dst0, dst1, dst01
+    bilinear_load_dst_8888 numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_load_dst_8888_add numpix, dst0, dst1, dst01
+    bilinear_load_dst_8888 numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_load_dst dst_fmt, op, numpix, dst0, dst1, dst01
+    bilinear_load_dst_&dst_fmt&_&op numpix, dst0, dst1, dst01
+.endm
+
+/*
+ * Macros for duplicating partially loaded mask to fill entire register.
+ * We will apply mask to interleaved source pixels, that is
+ *  (r0, r1, r2, r3, g0, g1, g2, g3) x (m0, m1, m2, m3, m0, m1, m2, m3)
+ *  (b0, b1, b2, b3, a0, a1, a2, a3) x (m0, m1, m2, m3, m0, m1, m2, m3)
+ * So, we need to duplicate loaded mask into whole register.
+ *
+ * For two pixel case
+ *  (r0, r1, x, x, g0, g1, x, x) x (m0, m1, m0, m1, m0, m1, m0, m1)
+ *  (b0, b1, x, x, a0, a1, x, x) x (m0, m1, m0, m1, m0, m1, m0, m1)
+ * We can do some optimizations for this including one pixel cases.
+ */
+.macro bilinear_duplicate_mask_n numpix, mask
+.endm
+
+.macro bilinear_duplicate_mask_8 numpix, mask
+.if numpix == 4
+    vdup.32     mask, mask[0]
+.elseif numpix == 2
+    vdup.16     mask, mask[0]
+.elseif numpix == 1
+    vdup.8      mask, mask[0]
+.else
+    .error bilinear_duplicate_mask_8 is unsupported
+.endif
+.endm
+
+.macro bilinear_duplicate_mask mask_fmt, numpix, mask
+    bilinear_duplicate_mask_&mask_fmt numpix, mask
+.endm
+
+/*
+ * Macros for interleaving src and dst pixels to rrrr gggg bbbb aaaa form.
+ * Interleave should be done when maks is enabled or operator is 'over'.
+ */
+.macro bilinear_interleave src0, src1, dst0, dst1
+    vuzp.8      src0, src1
+    vuzp.8      dst0, dst1
+    vuzp.8      src0, src1
+    vuzp.8      dst0, dst1
+.endm
+
+.macro bilinear_interleave_src_dst_n_src numpix, src0, src1, src01, dst0, dst1, dst01
+.endm
+
+.macro bilinear_interleave_src_dst_n_over numpix, src0, src1, src01, dst0, dst1, dst01
+    bilinear_interleave src0, src1, dst0, dst1
+.endm
+
+.macro bilinear_interleave_src_dst_n_add numpix, src0, src1, src01, dst0, dst1, dst01
+.endm
+
+.macro bilinear_interleave_src_dst_8_src numpix, src0, src1, src01, dst0, dst1, dst01
+    bilinear_interleave src0, src1, dst0, dst1
+.endm
+
+.macro bilinear_interleave_src_dst_8_over numpix, src0, src1, src01, dst0, dst1, dst01
+    bilinear_interleave src0, src1, dst0, dst1
+.endm
+
+.macro bilinear_interleave_src_dst_8_add numpix, src0, src1, src01, dst0, dst1, dst01
+    bilinear_interleave src0, src1, dst0, dst1
+.endm
+
+.macro bilinear_interleave_src_dst mask_fmt, op, numpix, src0, src1, src01, dst0, dst1, dst01
+    bilinear_interleave_src_dst_&mask_fmt&_&op numpix, src0, src1, src01, dst0, dst1, dst01
+.endm
+
+
+/*
+ * Macros for applying masks to src pixels. (see combine_mask_u() function)
+ * src, dst should be in interleaved form, mask register should be in form (m0, m1, m2, m3)
+ */
+.macro bilinear_apply_mask_to_src_n numpix, src0, src1, src01, mask, tmp01, tmp23, tmp45, tmp67
+.endm
+
+.macro bilinear_apply_mask_to_src_8 numpix, src0, src1, src01, mask, tmp01, tmp23, tmp45, tmp67
+    vmull.u8        tmp01, src0, mask
+    vmull.u8        tmp23, src1, mask
+    /* bubbles */
+    vrshr.u16       tmp45, tmp01, #8
+    vrshr.u16       tmp67, tmp23, #8
+    /* bubbles */
+    vraddhn.u16     src0, tmp45, tmp01
+    vraddhn.u16     src1, tmp67, tmp23
+.endm
+
+.macro bilinear_apply_mask_to_src mask_fmt, numpix, src0, src1, src01, mask, tmp01, tmp23, tmp45, tmp67
+    bilinear_apply_mask_to_src_&mask_fmt numpix, src0, src1, src01, mask, tmp01, tmp23, tmp45, tmp67
+.endm
+
+
+/*
+ * Macros for combining src and destination pixels.
+ * Interleave or not is depending on operator 'op'.
+ */
+.macro bilinear_combine_src numpix, src0, src1, src01, dst0, dst1, dst01, tmp01, tmp23, tmp45, tmp67, tmp8
+.endm
+
+.macro bilinear_combine_over numpix, src0, src1, src01, dst0, dst1, dst01, tmp01, tmp23, tmp45, tmp67, tmp8
+    vdup.32     tmp8, src1[1]
+    /* bubbles */
+    vmvn.8      tmp8, tmp8
+    /* bubbles */
+    vmull.u8    tmp01, dst0, tmp8
+    /* bubbles */
+    vmull.u8    tmp23, dst1, tmp8
+    /* bubbles */
+    vrshr.u16   tmp45, tmp01, #8
+    vrshr.u16   tmp67, tmp23, #8
+    /* bubbles */
+    vraddhn.u16 dst0, tmp45, tmp01
+    vraddhn.u16 dst1, tmp67, tmp23
+    /* bubbles */
+    vqadd.u8    src01, dst01, src01
+.endm
+
+.macro bilinear_combine_add numpix, src0, src1, src01, dst0, dst1, dst01, tmp01, tmp23, tmp45, tmp67, tmp8
+    vqadd.u8    src01, dst01, src01
+.endm
+
+.macro bilinear_combine op, numpix, src0, src1, src01, dst0, dst1, dst01, tmp01, tmp23, tmp45, tmp67, tmp8
+    bilinear_combine_&op numpix, src0, src1, src01, dst0, dst1, dst01, tmp01, tmp23, tmp45, tmp67, tmp8
+.endm
+
+/*
+ * Macros for final deinterleaving of destination pixels if needed.
+ */
+.macro bilinear_deinterleave numpix, dst0, dst1, dst01
+    vuzp.8      dst0, dst1
+    /* bubbles */
+    vuzp.8      dst0, dst1
+.endm
+
+.macro bilinear_deinterleave_dst_n_src numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_deinterleave_dst_n_over numpix, dst0, dst1, dst01
+    bilinear_deinterleave numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_deinterleave_dst_n_add numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_deinterleave_dst_8_src numpix, dst0, dst1, dst01
+    bilinear_deinterleave numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_deinterleave_dst_8_over numpix, dst0, dst1, dst01
+    bilinear_deinterleave numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_deinterleave_dst_8_add numpix, dst0, dst1, dst01
+    bilinear_deinterleave numpix, dst0, dst1, dst01
+.endm
+
+.macro bilinear_deinterleave_dst mask_fmt, op, numpix, dst0, dst1, dst01
+    bilinear_deinterleave_dst_&mask_fmt&_&op numpix, dst0, dst1, dst01
+.endm
+
+
+.macro bilinear_interpolate_last_pixel src_fmt, mask_fmt, dst_fmt, op
     bilinear_load_&src_fmt d0, d1, d2
+    bilinear_load_mask mask_fmt, 1, d4
+    bilinear_load_dst dst_fmt, op, 1, d18, d19, q9
     vmull.u8  q1, d0, d28
     vmlal.u8  q1, d1, d29
     vshr.u16  d30, d24, #8
@@ -2563,16 +2815,23 @@ fname:
     vmlsl.u16 q0, d2, d30
     vmlal.u16 q0, d3, d30
     /* 5 cycles bubble */
+    bilinear_duplicate_mask mask_fmt, 1, d4
     vshrn.u32 d0, q0, #16
     /* 3 cycles bubble */
     vmovn.u16 d0, q0
     /* 1 cycle bubble */
+    bilinear_interleave_src_dst mask_fmt, op, 1, d0, d1, q0, d18, d19, q9
+    bilinear_apply_mask_to_src mask_fmt, 1, d0, d1, q0, d4, q3, q8, q10, q11
+    bilinear_combine op, 1, d0, d1, q0, d18, d19, q9, q3, q8, q10, q11, d5
+    bilinear_deinterleave_dst mask_fmt, op, 1, d18, d19, q9
     bilinear_store_&dst_fmt 1, q2, q3
 .endm
 
-.macro bilinear_interpolate_two_pixels src_fmt, dst_fmt
+.macro bilinear_interpolate_two_pixels src_fmt, mask_fmt, dst_fmt, op
     bilinear_load_and_vertical_interpolate_two_&src_fmt \
                 q1, q11, d0, d1, d20, d21, d22, d23
+    bilinear_load_mask mask_fmt, 2, d4
+    bilinear_load_dst dst_fmt, op, 2, d18, d19, q9
     vshr.u16  q15, q12, #8
     vadd.u16  q12, q12, q13
     vshll.u16 q0, d2, #8
@@ -2583,11 +2842,16 @@ fname:
     vmlal.u16 q10, d23, d31
     vshrn.u32 d30, q0, #16
     vshrn.u32 d31, q10, #16
+    bilinear_duplicate_mask mask_fmt, 2, d4
     vmovn.u16 d0, q15
+    bilinear_interleave_src_dst mask_fmt, op, 2, d0, d1, q1, d18, d19, q9
+    bilinear_apply_mask_to_src mask_fmt, 2, d0, d1, q0, d4, q3, q8, q10, q11
+    bilinear_combine op, 2, d0, d1, q0, d18, d19, q9, q3, q8, q10, q11, d5
+    bilinear_deinterleave_dst mask_fmt, op, 2, d18, d19, q9
     bilinear_store_&dst_fmt 2, q2, q3
 .endm
 
-.macro bilinear_interpolate_four_pixels src_fmt, dst_fmt
+.macro bilinear_interpolate_four_pixels src_fmt, mask_fmt, dst_fmt, op
     bilinear_load_and_vertical_interpolate_four_&src_fmt \
                 q1, q11, d0, d1, d20, d21, d22, d23 \
                 q3, q9,  d4, d5, d16, d17, d18, d19
@@ -2605,6 +2869,8 @@ fname:
     vmlsl.u16 q2, d6, d30
     vmlal.u16 q2, d7, d30
     vshll.u16 q8, d18, #8
+    bilinear_load_mask mask_fmt, 4, d30
+    bilinear_load_dst dst_fmt, op, 4, d2, d3, q1
     pld       [TMP2, PF_OFFS]
     vmlsl.u16 q8, d18, d31
     vmlal.u16 q8, d19, d31
@@ -2613,8 +2879,13 @@ fname:
     vshrn.u32 d1, q10, #16
     vshrn.u32 d4, q2, #16
     vshrn.u32 d5, q8, #16
+    bilinear_duplicate_mask mask_fmt, 4, d30
     vmovn.u16 d0, q0
     vmovn.u16 d1, q2
+    bilinear_interleave_src_dst mask_fmt, op, 4, d0, d1, q0, d2, d3, q1
+    bilinear_apply_mask_to_src mask_fmt, 4, d0, d1, q0, d30, q3, q8, q9, q10
+    bilinear_combine op, 4, d0, d1, q0, d2, d3, q1, q3, q8, q9, q10, d22
+    bilinear_deinterleave_dst mask_fmt, op, 4, d2, d3, q1
     bilinear_store_&dst_fmt 4, q2, q3
 .endm
 
@@ -2634,28 +2905,29 @@ fname:
  *                      pixels ahead
  */
 
-.macro generate_bilinear_scanline_func fname, src_fmt, dst_fmt, \
+.macro generate_bilinear_scanline_func fname, src_fmt, mask_fmt, dst_fmt, op, \
                                        bpp_shift, prefetch_distance
 
 pixman_asm_function fname
     OUT       .req      r0
-    TOP       .req      r1
-    BOTTOM    .req      r2
-    WT        .req      r3
-    WB        .req      r4
-    X         .req      r5
-    UX        .req      r6
+    MASK      .req      r1
+    TOP       .req      r2
+    BOTTOM    .req      r3
+    WT        .req      r4
+    WB        .req      r5
+    X         .req      r6
+    UX        .req      r7
     WIDTH     .req      ip
-    TMP1      .req      r3
-    TMP2      .req      r4
-    PF_OFFS   .req      r7
-    TMP3      .req      r8
-    TMP4      .req      r9
+    TMP1      .req      r4
+    TMP2      .req      r5
+    PF_OFFS   .req      r8
+    TMP3      .req      r9
+    TMP4      .req      r10
 
     mov       ip, sp
-    push      {r4, r5, r6, r7, r8, r9}
+    push      {r4, r5, r6, r7, r8, r9, r10}
     mov       PF_OFFS, #prefetch_distance
-    ldmia     ip, {WB, X, UX, WIDTH}
+    ldmia     ip, {WT, WB, X, UX, WIDTH}
     mul       PF_OFFS, PF_OFFS, UX
 
     cmp       WIDTH, #0
@@ -2672,19 +2944,19 @@ pixman_asm_function fname
     blt       1f
     mov       PF_OFFS, PF_OFFS, asr #(16 - bpp_shift)
 0:
-    bilinear_interpolate_four_pixels src_fmt, dst_fmt
+    bilinear_interpolate_four_pixels src_fmt, mask_fmt, dst_fmt, op
     subs      WIDTH, WIDTH, #4
     bge       0b
 1:
     tst       WIDTH, #2
     beq       2f
-    bilinear_interpolate_two_pixels src_fmt, dst_fmt
+    bilinear_interpolate_two_pixels src_fmt, mask_fmt, dst_fmt, op
 2:
     tst       WIDTH, #1
     beq       3f
-    bilinear_interpolate_last_pixel src_fmt, dst_fmt
+    bilinear_interpolate_last_pixel src_fmt, mask_fmt, dst_fmt, op
 3:
-    pop       {r4, r5, r6, r7, r8, r9}
+    pop       {r4, r5, r6, r7, r8, r9, r10}
     bx        lr
 
     .unreq    OUT
@@ -2695,6 +2967,7 @@ pixman_asm_function fname
     .unreq    X
     .unreq    UX
     .unreq    WIDTH
+    .unreq    MASK
     .unreq    TMP1
     .unreq    TMP2
     .unreq    PF_OFFS
@@ -2705,13 +2978,28 @@ pixman_asm_function fname
 .endm
 
 generate_bilinear_scanline_func \
-    pixman_scaled_bilinear_scanline_8888_8888_SRC_asm_neon, 8888, 8888, 2, 28
+    pixman_scaled_bilinear_scanline_8888_n_8888_SRC_asm_neon, 8888, n, 8888, src, 2, 28
 
 generate_bilinear_scanline_func \
-    pixman_scaled_bilinear_scanline_8888_0565_SRC_asm_neon, 8888, 0565, 2, 28
+    pixman_scaled_bilinear_scanline_8888_n_0565_SRC_asm_neon, 8888, n, 0565, src, 2, 28
 
 generate_bilinear_scanline_func \
-    pixman_scaled_bilinear_scanline_0565_x888_SRC_asm_neon, 0565, 8888, 1, 28
+    pixman_scaled_bilinear_scanline_0565_n_x888_SRC_asm_neon, 0565, n, 8888, src, 1, 28
 
 generate_bilinear_scanline_func \
-    pixman_scaled_bilinear_scanline_0565_0565_SRC_asm_neon, 0565, 0565, 1, 28
+    pixman_scaled_bilinear_scanline_0565_n_0565_SRC_asm_neon, 0565, n, 0565, src, 1, 28
+
+generate_bilinear_scanline_func \
+    pixman_scaled_bilinear_scanline_8888_n_8888_OVER_asm_neon, 8888, n, 8888, over, 2, 28
+
+generate_bilinear_scanline_func \
+    pixman_scaled_bilinear_scanline_8888_n_8888_ADD_asm_neon, 8888, n, 8888, add, 2, 28
+
+generate_bilinear_scanline_func \
+    pixman_scaled_bilinear_scanline_8888_8_8888_SRC_asm_neon, 8888, 8, 8888, src, 2, 28
+
+generate_bilinear_scanline_func \
+    pixman_scaled_bilinear_scanline_8888_8_8888_OVER_asm_neon, 8888, 8, 8888, over, 2, 28
+
+generate_bilinear_scanline_func \
+    pixman_scaled_bilinear_scanline_8888_8_8888_ADD_asm_neon, 8888, 8, 8888, add, 2, 28
